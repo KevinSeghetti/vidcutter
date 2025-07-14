@@ -125,8 +125,8 @@ class VideoCutter(QWidget):
         self.videoService.addScenes.connect(self.addScenes)
 
         self.project_files = {
-            'edl': re.compile(r'(\d+(?:\.?\d+)?)\t(\d+(?:\.?\d+)?)\t([01])'),
-            'vcp': re.compile(r'(\d+(?:\.?\d+)?)\t(\d+(?:\.?\d+)?)\t([01])\t(".*")$')
+            'edl': re.compile(r'(\d+(?:\.?\d+)?)[\t ]+(\d+(?:\.?\d+)?)[\t ]+([01])'),
+            'vcp': re.compile(r'(\d+(?:\.?\d+)?)[\t ]+(\d+(?:\.?\d+)?)[\t ]+([01])(?:[\t ]+(".*"))?$')
         }
 
         self._initIcons()
@@ -860,11 +860,13 @@ class VideoCutter(QWidget):
                     else:
                         mo = self.project_files[project_type].match(line)
                         if mo:
-                            start, stop, _, chapter = mo.groups()
+                            groups = mo.groups()
+                            start, stop, _ = groups[:3]
+                            chapter = groups[3] if len(groups) > 3 else None
                             clip_start = self.delta2QTime(float(start))
                             clip_end = self.delta2QTime(float(stop))
                             clip_image = self.captureImage(self.currentMedia, clip_start)
-                            if project_type == 'vcp' and self.createChapters and len(chapter):
+                            if project_type == 'vcp' and self.createChapters and chapter and len(chapter):
                                 chapter = chapter[1:len(chapter) - 1]
                                 if not len(chapter):
                                     chapter = None
