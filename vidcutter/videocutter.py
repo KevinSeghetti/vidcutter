@@ -943,26 +943,27 @@ class VideoCutter(QWidget):
                                      'Cannot save project file at {0}:\n\n{1}'.format(project_save, file.errorString()))
                 return
             qApp.setOverrideCursor(Qt.WaitCursor)
-            if ptype == 'VidCutter Project (*.vcp)':
-                # noinspection PyUnresolvedReferences
-                QTextStream(file) << '{}\n'.format(self.currentMedia)
+            stream = QTextStream(file)
+            # Check if we're saving a VCP file by checking the file extension as well
+            if ptype == 'VidCutter Project (*.vcp)' or project_save.endswith('.vcp'):
+                stream << '{}\n'.format(self.currentMedia)
             for clip in self.clipTimes:
                 start_time = timedelta(hours=clip[0].hour(), minutes=clip[0].minute(), seconds=clip[0].second(),
                                        milliseconds=clip[0].msec())
                 stop_time = timedelta(hours=clip[1].hour(), minutes=clip[1].minute(), seconds=clip[1].second(),
                                       milliseconds=clip[1].msec())
-                if ptype == 'VidCutter Project (*.vcp)':
-                    if self.createChapters:
-                        chapter = '"{}"'.format(clip[4]) if clip[4] is not None else '""'
+                if ptype == 'VidCutter Project (*.vcp)' or project_save.endswith('.vcp'):
+                    if self.createChapters and clip[4] is not None:
+                        chapter = '"{}"'.format(clip[4])
+                        stream << '{0}\t{1}\t{2}\t{3}\n'.format(self.delta2String(start_time),
+                                                                 self.delta2String(stop_time), 0, chapter)
                     else:
-                        chapter = ''
-                    # noinspection PyUnresolvedReferences
-                    QTextStream(file) << '{0}\t{1}\t{2}\t{3}\n'.format(self.delta2String(start_time),
-                                                                       self.delta2String(stop_time), 0, chapter)
+                        stream << '{0}\t{1}\t{2}\n'.format(self.delta2String(start_time),
+                                                            self.delta2String(stop_time), 0)
                 else:
-                    # noinspection PyUnresolvedReferences
-                    QTextStream(file) << '{0}\t{1}\t{2}\n'.format(self.delta2String(start_time),
-                                                                  self.delta2String(stop_time), 0)
+                    stream << '{0}\t{1}\t{2}\n'.format(self.delta2String(start_time),
+                                                        self.delta2String(stop_time), 0)
+            file.close()
             qApp.restoreOverrideCursor()
             self.projectSaved = True
             if not reboot:
