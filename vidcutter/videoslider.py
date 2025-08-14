@@ -229,9 +229,12 @@ class VideoSlider(QSlider):
     def updateProgress(self, region: int=None) -> None:
         if len(self._regions):
             if region is None:
-                [progress.setValue(progress.value() + 1) for progress in self._progressbars]
+                [progress.setValue(min(progress.maximum(), progress.value() + 1)) for progress in self._progressbars]
             else:
-                self._progressbars[region].setValue(self._progressbars[region].value() + 1)
+                if region < len(self._progressbars):
+                    current = self._progressbars[region].value()
+                    maximum = self._progressbars[region].maximum()
+                    self._progressbars[region].setValue(min(maximum, current + 1))
         else:
             self.parent.cliplist.updateProgress(region)
 

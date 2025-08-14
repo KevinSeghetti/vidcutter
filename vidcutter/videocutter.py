@@ -1358,7 +1358,16 @@ class VideoCutter(QWidget):
             if not os.path.isdir(self.workFolder):
                 os.mkdir(self.workFolder)
             if self.smartcut:
-                self.seekSlider.showProgress(6 if clips > 1 else 5)
+                # Check if user wants to force fast mode via environment variable
+                if os.getenv('VIDCUTTER_FAST_SMARTCUT', False):
+                    self.videoService.fast_smartcut = True
+                    self.logger.info('Fast SmartCut mode enabled via environment variable')
+                    
+                source_media = '{0}{1}'.format(source_file, source_ext)
+                smartcut_steps = self.videoService.calculateSmartCutSteps(source_media, self.clipTimes)
+                if os.getenv('DEBUG', False) or getattr(self, 'verboseLogs', False):
+                    self.logger.info('SmartCut calculated steps: {} for {} clips'.format(smartcut_steps, clips))
+                self.seekSlider.showProgress(smartcut_steps)
                 self.parent.lock_gui(True)
                 self.videoService.smartinit(clips)
                 self.smartcutter(file, source_file, source_ext)
@@ -1428,27 +1437,48 @@ class VideoCutter(QWidget):
             self.seekSlider.updateProgress()
             rc = False
             chapters = None
-            if self.createChapters:
-                chapters = []
-                [
-                    chapters.append(clip[4] if clip[4] is not None else 'Chapter {}'.format(index + 1))
-                    for index, clip in enumerate(self.clipTimes)
-                ]
-            if self.videoService.isMPEGcodec(filelist[0]):
-                self.logger.info('source file is MPEG based so join via MPEG-TS')
-                rc = self.videoService.mpegtsJoin(filelist, self.finalFilename, chapters)
-            if not rc or QFile(self.finalFilename).size() < 1000:
-                self.logger.info('MPEG-TS based join failed, will retry using standard concat')
-                rc = self.videoService.join(filelist, self.finalFilename, True, chapters)
-            if not rc or QFile(self.finalFilename).size() < 1000:
-                self.logger.info('join resulted in 0 length file, trying again without all stream mapping')
-                self.videoService.join(filelist, self.finalFilename, False, chapters)
-            if not self.keepClips:
-                for f in filelist:
-                    clip = self.clipTimes[filelist.index(f)]
-                    if not len(clip[3]) and os.path.isfile(f):
-                        QFile.remove(f)
-            self.complete(False)
+            try:
+                if self.createChapters:
+                    chapters = []
+                    [
+                        chapters.append(clip[4] if clip[4] is not None else 'Chapter {}'.format(index + 1))
+                        for index, clip in enumerate(self.clipTimes)
+                    ]
+                
+                # Try MPEG-TS join if applicable
+                try:
+                    if self.videoService.isMPEGcodec(filelist[0]):
+                        self.logger.info('source file is MPEG based so join via MPEG-TS')
+                        rc = self.videoService.mpegtsJoin(filelist, self.finalFilename, chapters)
+                except Exception as e:
+                    self.logger.warning('Error checking MPEG codec: {}'.format(e))
+                    rc = False
+                
+                # Fallback to standard concat join
+                if not rc or not os.path.exists(self.finalFilename) or QFile(self.finalFilename).size() < 1000:
+                    self.logger.info('MPEG-TS based join failed or skipped, will retry using standard concat')
+                    rc = self.videoService.join(filelist, self.finalFilename, True, chapters)
+                
+                # Try without all stream mapping if still failed
+                if not rc or not os.path.exists(self.finalFilename) or QFile(self.finalFilename).size() < 1000:
+                    self.logger.info('join resulted in 0 length file, trying again without all stream mapping')
+                    self.videoService.join(filelist, self.finalFilename, False, chapters)
+                
+                # Clean up temporary files if needed
+                if not self.keepClips:
+                    for f in filelist:
+                        try:
+                            clip = self.clipTimes[filelist.index(f)]
+                            if not len(clip[3]) and os.path.isfile(f):
+                                QFile.remove(f)
+                        except Exception as e:
+                            self.logger.warning('Error cleaning up file {}: {}'.format(f, e))
+                
+                self.complete(False)
+                
+            except Exception as e:
+                self.logger.error('Join operation failed: {}'.format(e))
+                self.completeOnError('Failed to join media files: {}'.format(str(e)))
         else:
             self.complete(True, filelist[-1])
 

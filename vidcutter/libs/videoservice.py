@@ -264,8 +264,10 @@ class VideoService(QObject):
         else:
             args = '-i "{}"'.format(source)
             result = self.cmdExec(self.backends.ffmpeg, args, True)
-            vcodec = re.search(r'Stream.*Video:\s(\w+)', result).group(1)
-            acodec = re.search(r'Stream.*Audio:\s(\w+)', result).group(1)
+            vcodec_match = re.search(r'Stream.*Video:\s(\w+)', result)
+            vcodec = vcodec_match.group(1) if vcodec_match else None
+            acodec_match = re.search(r'Stream.*Audio:\s(\w+)', result)
+            acodec = acodec_match.group(1) if acodec_match else None
             return vcodec, acodec
 
     def parseMappings(self, allstreams: bool = True) -> str:
@@ -326,11 +328,82 @@ class VideoService(QObject):
             for index in range(clips)
         ]
 
+    def calculateSmartCutSteps(self, source: str, clipTimes: list) -> int:
+        """Calculate the exact number of progress steps needed for SmartCut processing"""
+        # Use a conservative estimate to avoid blocking keyframe analysis during UI setup
+        # Each clip: start(possible) + middle + end(possible) + join = max 4 steps per clip + final join
+        non_external_clips = len([clip for clip in clipTimes if not (len(clip) > 3 and len(clip[3]))])
+        
+        # For single clip: usually 3-4 steps (middle + join + possible start/end)
+        # For multiple clips: add final join step
+        if non_external_clips == 1:
+            return 4  # Conservative estimate for single clip
+        else:
+            return non_external_clips * 3 + 1  # Conservative estimate: middle + join per clip + final join
+
     def smartcut(self, index: int, source: str, output: str, start: float, end: float, allstreams: bool = True) -> None:
         output_file, output_ext = os.path.splitext(output)
+        
+        # Check if user wants fast cuts (skip keyframe analysis entirely for speed)
+        fast_mode = getattr(self, 'fast_smartcut', False) or os.getenv('VIDCUTTER_FAST_SMARTCUT', False)
+        
+        if fast_mode:
+            # Ultra-fast mode: skip keyframe analysis, use stream copy with user's exact times
+            self.logger.info('SmartCut: Using ultra-fast mode (stream copy) for clip {}'.format(index))
+            self.smartcut_jobs[index].output = output
+            self.smartcut_jobs[index].allstreams = allstreams
+            self.smartcut_jobs[index].files.update(middle='{0}_middle_{1}{2}'
+                                                   .format(output_file, '{0:0>2}'.format(index), output_ext))
+            middleproc = VideoService.initProc(self.backends.ffmpeg, self.smartcheck, os.path.dirname(source))
+            middleproc.setProcessChannelMode(QProcess.MergedChannels)
+            middleproc.setWorkingDirectory(os.path.dirname(self.smartcut_jobs[index].files['middle']))
+            middleproc.setObjectName('middle.{}'.format(index))
+            middleproc.started.connect(lambda: self.progress.emit(index))
+            middleproc.setArguments(shlex.split(
+                self.cut(source=source,
+                         output=self.smartcut_jobs[index].files['middle'],
+                         frametime=str(start),
+                         duration=str(end - start),
+                         allstreams=allstreams,
+                         run=False)))
+            self.smartcut_jobs[index].procs.update(middle=middleproc)
+            self.smartcut_jobs[index].results.update(middle=False)
+            middleproc.start()
+            return
+        
         bisections = self.getGOPbisections(source, start, end)
         self.smartcut_jobs[index].output = output
         self.smartcut_jobs[index].allstreams = allstreams
+        
+        # Check if we can do a fast keyframe-aligned cut instead of slow re-encoding
+        start_keyframe_aligned = abs(bisections['start'][1] - start) < 0.1  # Within 100ms of keyframe
+        end_keyframe_aligned = abs(bisections['end'][1] - end) < 0.1  # Within 100ms of keyframe
+        
+        if start_keyframe_aligned and end_keyframe_aligned:
+            # Fast path: both start and end are close to keyframes, use stream copy
+            self.logger.info('SmartCut: Using fast keyframe-aligned cut for clip {}'.format(index))
+            self.smartcut_jobs[index].files.update(middle='{0}_middle_{1}{2}'
+                                                   .format(output_file, '{0:0>2}'.format(index), output_ext))
+            middleproc = VideoService.initProc(self.backends.ffmpeg, self.smartcheck, os.path.dirname(source))
+            middleproc.setProcessChannelMode(QProcess.MergedChannels)
+            middleproc.setWorkingDirectory(os.path.dirname(self.smartcut_jobs[index].files['middle']))
+            middleproc.setObjectName('middle.{}'.format(index))
+            middleproc.started.connect(lambda: self.progress.emit(index))
+            middleproc.setArguments(shlex.split(
+                self.cut(source=source,
+                         output=self.smartcut_jobs[index].files['middle'],
+                         frametime=str(bisections['start'][1]),  # Use keyframe time
+                         duration=str(bisections['end'][1] - bisections['start'][1]),
+                         allstreams=allstreams,
+                         run=False)))
+            self.smartcut_jobs[index].procs.update(middle=middleproc)
+            self.smartcut_jobs[index].results.update(middle=False)
+            middleproc.start()
+            return
+        
+        # Slow path: need re-encoding for frame-accurate cuts
+        self.logger.info('SmartCut: Using frame-accurate re-encoding for clip {} (may be slow)'.format(index))
+        
         # ----------------------[ STEP 1 - start of clip if not starting on a keyframe ]-------------------------
         if bisections['start'][1] > bisections['start'][0]:
             self.smartcut_jobs[index].files.update(start='{0}_start_{1}{2}'
@@ -389,13 +462,26 @@ class VideoService(QObject):
     @pyqtSlot(int, QProcess.ExitStatus)
     def smartcheck(self, code: int, status: QProcess.ExitStatus) -> None:
         if hasattr(self, 'smartcut_jobs') and not self.smartcutError:
-            name, index = self.sender().objectName().split('.')
-            index = int(index)
+            try:
+                name, index = self.sender().objectName().split('.')
+                index = int(index)
+            except (ValueError, AttributeError) as e:
+                self.logger.error('SmartCut: Error parsing process name: {}'.format(e))
+                return
+                
             self.smartcut_jobs[index].results[name] = (code == 0 and status == QProcess.NormalExit)
+            self.logger.info('SmartCut: Process {} for clip {} finished with code {} status {}'.format(
+                name, index, code, status))
+            
             if os.getenv('DEBUG', False) or getattr(self.parent, 'verboseLogs', False):
                 self.logger.info('SmartCut progress: {}'.format(self.smartcut_jobs[index].results))
+            
             resultfile = self.smartcut_jobs[index].files.get(name)
-            if not self.smartcut_jobs[index].results[name] or os.path.getsize(resultfile) < 1000:
+            if not resultfile:
+                self.logger.error('SmartCut: No output file defined for {} segment'.format(name))
+                return
+                
+            if not self.smartcut_jobs[index].results[name] or not os.path.exists(resultfile) or os.path.getsize(resultfile) < 1000:
                 args = self.smartcut_jobs[index].procs[name].arguments()
                 if '-map' in args:
                     self.logger.info('SmartCut resulted in zero length file, trying again without all stream mapping')
@@ -419,7 +505,7 @@ class VideoService(QObject):
             else:
                 if name == 'start':
                     self.smartcut_jobs[index].procs['middle'].start()
-                elif name == 'middle':
+                elif name == 'middle' and 'end' in self.smartcut_jobs[index].procs:
                     self.smartcut_jobs[index].procs['end'].start()
 
     def smartabort(self):
@@ -432,18 +518,37 @@ class VideoService(QObject):
     def smartjoin(self, index: int) -> None:
         self.progress.emit(index)
         final_join = False
-        joinlist = [
-            self.smartcut_jobs[index].files.get('start'),
-            self.smartcut_jobs[index].files.get('middle'),
-            self.smartcut_jobs[index].files.get('end')
-        ]
-        if self.isMPEGcodec(joinlist[1]):
-            self.logger.info('smartcut files are MPEG based so join via MPEG-TS')
-            final_join = self.mpegtsJoin(joinlist, self.smartcut_jobs[index].output, None)
-        if not final_join:
-            self.logger.info('smartcut MPEG-TS join failed, retry with standard concat')
-            final_join = self.join(joinlist, self.smartcut_jobs[index].output,
-                                   self.smartcut_jobs[index].allstreams, None)
+        
+        # Build joinlist with only existing files
+        joinlist = []
+        for segment in ['start', 'middle', 'end']:
+            filepath = self.smartcut_jobs[index].files.get(segment)
+            if filepath and os.path.exists(filepath):
+                joinlist.append(filepath)
+        
+        if not joinlist:
+            self.logger.error('SmartCut: No files to join for clip {}'.format(index))
+            self.finished.emit(False, self.smartcut_jobs[index].output)
+            return
+        
+        # If only one file (e.g., just middle), no join needed - just rename
+        if len(joinlist) == 1:
+            try:
+                os.rename(joinlist[0], self.smartcut_jobs[index].output)
+                final_join = True
+            except Exception as e:
+                self.logger.error('SmartCut: Failed to rename single segment: {}'.format(e))
+                final_join = False
+        else:
+            # Multiple files need joining
+            if joinlist and self.isMPEGcodec(joinlist[0]):
+                self.logger.info('smartcut files are MPEG based so join via MPEG-TS')
+                final_join = self.mpegtsJoin(joinlist, self.smartcut_jobs[index].output, None)
+            if not final_join:
+                self.logger.info('smartcut MPEG-TS join failed, retry with standard concat')
+                final_join = self.join(joinlist, self.smartcut_jobs[index].output,
+                                       self.smartcut_jobs[index].allstreams, None)
+        
         VideoService.cleanup(joinlist)
         self.finished.emit(final_join, self.smartcut_jobs[index].output)
 
@@ -564,10 +669,32 @@ class VideoService(QObject):
     def getKeyframes(self, source: str, formatted_time: bool = False) -> list:
         if len(self.keyframes) and source == self.source:
             return self.keyframes
+        
+        if os.getenv('DEBUG', False) or getattr(self.parent, 'verboseLogs', False):
+            self.logger.info('Analyzing keyframes for SmartCut - this may take some time for large files...')
+            
         timecode = '0:00:00.000000' if formatted_time else 0
         args = '-v error -show_packets -select_streams v -show_entries packet=pts_time,flags ' \
                '{0}-of csv "{1}"'.format('-sexagesimal ' if formatted_time else '', source)
-        result = self.cmdExec(self.backends.ffprobe, args, output=True, suppresslog=True, mergechannels=False)
+        
+        # Use shorter timeout for keyframe analysis (30 seconds) to avoid hanging
+        # If it takes longer, we'll use fast mode instead
+        result = self.cmdExec(self.backends.ffprobe, args, output=True, suppresslog=True, 
+                             mergechannels=False, timeout=30000)
+        
+        if not result:
+            self.logger.warning('Keyframe analysis timed out or failed - enabling fast SmartCut mode')
+            # Enable fast mode to avoid slow re-encoding
+            self.fast_smartcut = True
+            # Return minimal keyframes based on duration
+            duration_seconds = self.duration().msecsSinceStartOfDay() / 1000.0
+            # Create keyframes every 2 seconds as fallback
+            keyframe_times = [i * 2.0 for i in range(int(duration_seconds / 2) + 1)]
+            keyframe_times.append(duration_seconds)
+            if source == self.source and not formatted_time:
+                self.keyframes = keyframe_times
+            return keyframe_times
+            
         keyframe_times = []
         for line in result.split('\n'):
             if line.split(',')[1] != 'N/A':
@@ -577,27 +704,47 @@ class VideoService(QObject):
                     keyframe_times.append(timecode[:-3])
                 else:
                     keyframe_times.append(float(timecode))
-        last_keyframe = self.duration().toString('h:mm:ss.zzz')
-        if keyframe_times[-1] != last_keyframe:
-            keyframe_times.append(last_keyframe)
+        
+        if not keyframe_times:
+            self.logger.warning('No keyframes found - using fallback keyframe timing')
+            duration_seconds = self.duration().msecsSinceStartOfDay() / 1000.0
+            keyframe_times = [i * 2.0 for i in range(int(duration_seconds / 2) + 1)]
+            keyframe_times.append(duration_seconds)
+        else:
+            duration_seconds = self.duration().msecsSinceStartOfDay() / 1000.0
+            if keyframe_times[-1] != duration_seconds:
+                keyframe_times.append(duration_seconds)
+                
         if source == self.source and not formatted_time:
             self.keyframes = keyframe_times
         return keyframe_times
 
     def getGOPbisections(self, source: str, start: float, end: float) -> dict:
         keyframes = self.getKeyframes(source)
+        if not keyframes:
+            # Fallback if no keyframes available
+            return {
+                'start': (start, start, start),
+                'end': (end, end, end)
+            }
+            
         start_pos = bisect_left(keyframes, start)
         end_pos = bisect_left(keyframes, end)
+        
+        # Ensure indices are within bounds
+        start_pos = min(start_pos, len(keyframes) - 1)
+        end_pos = min(end_pos, len(keyframes) - 1)
+        
         return {
             'start': (
                 keyframes[start_pos - 1] if start_pos > 0 else keyframes[start_pos],
                 keyframes[start_pos],
-                keyframes[start_pos + 1]
+                keyframes[start_pos + 1] if start_pos < len(keyframes) - 1 else keyframes[start_pos]
             ),
             'end': (
-                keyframes[end_pos - 2] if end_pos != (len(keyframes) - 1) else keyframes[end_pos - 1],
-                keyframes[end_pos - 1] if end_pos != (len(keyframes) - 1) else keyframes[end_pos],
-                keyframes[end_pos]
+                keyframes[end_pos - 2] if end_pos > 1 and end_pos != len(keyframes) - 1 else keyframes[max(0, end_pos - 1)],
+                keyframes[end_pos - 1] if end_pos > 0 and end_pos != len(keyframes) - 1 else keyframes[min(len(keyframes) - 1, end_pos)],
+                keyframes[end_pos] if end_pos < len(keyframes) else keyframes[len(keyframes) - 1]
             )
         }
 
@@ -605,7 +752,10 @@ class VideoService(QObject):
         if source is None and hasattr(self.streams, 'video'):
             codec = self.streams.video.codec_name
         else:
-            codec = self.codecs(source)[0].lower()
+            vcodec, _ = self.codecs(source)
+            if vcodec is None:
+                return False
+            codec = vcodec.lower()
             if codec == 'mpeg4' and os.path.splitext(source)[1] == '.avi':
                 return False
         return codec in VideoService.config.mpeg_formats
@@ -659,7 +809,7 @@ class VideoService(QObject):
         return self.cmdExec(self.backends.mediainfo, args, True, True)
 
     def cmdExec(self, cmd: str, args: str=None, output: bool=False, suppresslog: bool=False, workdir: str=None,
-                mergechannels: bool=True):
+                mergechannels: bool=True, timeout: int=60000):
         if self.proc.state() == QProcess.NotRunning:
             if cmd == self.backends.mediainfo or not mergechannels:
                 self.proc.setProcessChannelMode(QProcess.SeparateChannels)
@@ -671,7 +821,15 @@ class VideoService(QObject):
             self.proc.start(cmd, shlex.split(args))
             self.proc.readyReadStandardOutput.connect(
                 partial(self.cmdOut, self.proc.readAllStandardOutput().data().decode().strip()))
-            self.proc.waitForFinished(-1)
+            
+            # Use timeout to prevent infinite hanging, especially for keyframe analysis
+            if not self.proc.waitForFinished(timeout):
+                self.logger.warning('Process timed out after {}ms, terminating: {} {}'.format(timeout, cmd, args))
+                self.proc.terminate()
+                if not self.proc.waitForFinished(5000):  # Wait 5 seconds for termination
+                    self.proc.kill()
+                return False if not output else ''
+                
             if cmd == self.backends.mediainfo or not mergechannels:
                 self.proc.setProcessChannelMode(QProcess.MergedChannels)
             if output:

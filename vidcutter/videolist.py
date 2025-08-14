@@ -98,9 +98,12 @@ class VideoList(QListWidget):
     def updateProgress(self, item: int=None) -> None:
         if self.count():
             if item is None:
-                [progress.setValue(progress.value() + 1) for progress in self._progressbars]
+                [progress.setValue(min(progress.maximum(), progress.value() + 1)) for progress in self._progressbars]
             else:
-                self._progressbars[item].setValue(self._progressbars[item].value() + 1)
+                if item < len(self._progressbars):
+                    current = self._progressbars[item].value()
+                    maximum = self._progressbars[item].maximum()
+                    self._progressbars[item].setValue(min(maximum, current + 1))
 
     @pyqtSlot()
     def clearProgress(self) -> None:
