@@ -279,6 +279,16 @@ class VideoService(QObject):
         for stream_id in range(len(self.mappings)):
             if self.mappings[stream_id]:
                 output += '-map 0:{} '.format(stream_id)
+        
+        # If allstreams=False but no mappings were applied, ensure we at least include video and audio
+        if not allstreams and not output and hasattr(self, 'streams'):
+            # Always include the first video stream
+            if hasattr(self.streams, 'video') and self.streams.video:
+                output += '-map 0:v:0 '
+            # Always include the first audio stream if it exists
+            if hasattr(self.streams, 'audio') and len(self.streams.audio) > 0:
+                output += '-map 0:a:0 '
+                
         return output
 
     def finalize(self, source: str) -> bool:
@@ -307,9 +317,9 @@ class VideoService(QObject):
             result = self.cmdExec(self.backends.ffmpeg, args)
             if not result or os.path.getsize(output) < 1000:
                 if allstreams:
-                    # cut failed so try again without mapping all media streams
-                    self.logger.info('cut resulted in zero length file, trying again without all stream mapping')
-                    self.cut(source, output, frametime, duration, False)
+                    # cut failed so try again without mapping all media streams but preserve video and audio
+                    self.logger.info('cut resulted in zero length file, trying again with essential streams only (video + audio)')
+                    return self.cut(source, output, frametime, duration, False)
                 else:
                     # both attempts to cut have failed so exit and let user know
                     VideoService.cleanup([output])
@@ -484,10 +494,17 @@ class VideoService(QObject):
             if not self.smartcut_jobs[index].results[name] or not os.path.exists(resultfile) or os.path.getsize(resultfile) < 1000:
                 args = self.smartcut_jobs[index].procs[name].arguments()
                 if '-map' in args:
-                    self.logger.info('SmartCut resulted in zero length file, trying again without all stream mapping')
-                    pos = args.index('-map')
-                    args.remove('-map')
-                    del args[pos]
+                    self.logger.info('SmartCut resulted in zero length file, trying again with essential streams only (video + audio)')
+                    # Remove all existing -map arguments
+                    while '-map' in args:
+                        pos = args.index('-map')
+                        args.remove('-map')
+                        if pos < len(args):
+                            del args[pos]
+                    # Add essential stream mappings
+                    args.extend(['-map', '0:v:0'])  # First video stream
+                    if hasattr(self.streams, 'audio') and len(self.streams.audio) > 0:
+                        args.extend(['-map', '0:a:0'])  # First audio stream
                     self.smartcut_jobs[index].procs[name].setArguments(args)
                     self.smartcut_jobs[index].procs[name].started.disconnect()
                     self.smartcut_jobs[index].procs[name].start()
@@ -750,15 +767,20 @@ class VideoService(QObject):
 
     def isMPEGcodec(self, source: str = None) -> bool:
         if source is None and hasattr(self.streams, 'video'):
-            codec = self.streams.video.codec_name
+            vcodec = self.streams.video.codec_name
+            acodec = self.streams.audio[0].codec_name if len(self.streams.audio) > 0 else None
         else:
-            vcodec, _ = self.codecs(source)
+            vcodec, acodec = self.codecs(source)
             if vcodec is None:
                 return False
-            codec = vcodec.lower()
-            if codec == 'mpeg4' and os.path.splitext(source)[1] == '.avi':
+            if vcodec == 'mpeg4' and os.path.splitext(source)[1] == '.avi':
                 return False
-        return codec in VideoService.config.mpeg_formats
+        
+        # MPEG-TS join not compatible with PCM audio - it gets converted to binary data
+        if acodec and acodec.startswith('pcm_'):
+            return False
+            
+        return vcodec.lower() in VideoService.config.mpeg_formats
 
     # noinspection PyBroadException
     def mpegtsJoin(self, inputs: list, output: str, chapters: Optional[List[str]]=None) -> bool:
