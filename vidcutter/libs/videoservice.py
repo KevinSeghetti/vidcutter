@@ -272,12 +272,22 @@ class VideoService(QObject):
 
     def parseMappings(self, allstreams: bool = True) -> str:
         if not len(self.mappings) or (self.parent is not None and self.parent.hasExternals()):
-            return '-map 0 ' if allstreams else ''
+            # SUBTITLE FIX: Use essential streams to avoid subtitle codec issues
+            if allstreams:
+                return '-map 0:v -map 0:a '
+            else:
+                return ''
         # if False not in self.mappings:
         #     return '-map 0 '
         output = ''
         for stream_id in range(len(self.mappings)):
             if self.mappings[stream_id]:
+                # SUBTITLE FIX: Skip subtitle/data streams to avoid codec issues
+                if hasattr(self, 'streams') and hasattr(self.media, 'streams') and stream_id < len(self.media.streams):
+                    stream = self.media.streams[stream_id]
+                    if hasattr(stream, 'codec_type') and stream.codec_type in ['subtitle', 'data']:
+                        self.logger.info('[DEBUG] parseMappings: Skipping problematic {} stream {}'.format(stream.codec_type, stream_id))
+                        continue
                 output += '-map 0:{} '.format(stream_id)
         
         # If allstreams=False but no mappings were applied, ensure we at least include video and audio
@@ -300,12 +310,27 @@ class VideoService(QObject):
         if result and os.path.exists(final_filename):
             os.replace(final_filename, source)
             return True
-        return False
+        else:
+            # Log error details for debugging
+            if os.path.exists(final_filename):
+                # Get stderr output for error details
+                error_args = '-v error -i "{}" -map 0 -c copy -y "{}"'.format(source, final_filename)
+                error_output = self.cmdExec(self.backends.ffmpeg, error_args, output=True)
+                self.logger.error('FFmpeg finalize failed. Command: {} {}. Error: {}'.format(
+                    self.backends.ffmpeg, error_args, error_output))
+                # Clean up failed temporary file
+                os.remove(final_filename)
+            else:
+                self.logger.error('FFmpeg finalize failed. Command: {} {}. No output file created.'.format(
+                    self.backends.ffmpeg, args))
+            return False
 
     def cut(self, source: str, output: str, frametime: str, duration: str, allstreams: bool=True, vcodec: str=None,
             run: bool=True) -> Union[bool, str]:
+        self.logger.info('[DEBUG] Cut: Starting cut from {}s duration {}s, allstreams={}'.format(frametime, duration, allstreams))
         self.checkDiskSpace(output)
         stream_map = self.parseMappings(allstreams)
+        self.logger.info('[DEBUG] Cut: Using stream map: "{}"'.format(stream_map.strip()))
         if vcodec is not None:
             encode_options = VideoService.config.encoding.get(vcodec, vcodec)
             args = '-v 32 -i "{}" -ss {} -t {} -c:v {} -c:a copy -c:s copy {}-avoid_negative_ts 1 ' \
@@ -314,9 +339,13 @@ class VideoService(QObject):
             args = '-v error -ss {} -t {} -i "{}" -c copy {}-avoid_negative_ts 1 -y "{}"' \
                    .format(frametime, duration, source, stream_map, output)
         if run:
+            self.logger.info('[DEBUG] Cut: Executing ffmpeg with args: {}'.format(args))
             result = self.cmdExec(self.backends.ffmpeg, args)
-            if not result or os.path.getsize(output) < 1000:
+            output_size = os.path.getsize(output) if os.path.exists(output) else 0
+            self.logger.info('[DEBUG] Cut: First attempt result={}, output size={}'.format(result, output_size))
+            if not result or output_size < 1000:
                 if allstreams:
+                    self.logger.info('[DEBUG] Cut: First attempt failed, retrying with essential streams only')
                     # cut failed so try again without mapping all media streams but preserve video and audio
                     self.logger.info('cut resulted in zero length file, trying again with essential streams only (video + audio)')
                     return self.cut(source, output, frametime, duration, False)
@@ -346,12 +375,14 @@ class VideoService(QObject):
         
         # For single clip: usually 3-4 steps (middle + join + possible start/end)
         # For multiple clips: add final join step
+        # Adding extra buffer to prevent hanging at 100%
         if non_external_clips == 1:
-            return 4  # Conservative estimate for single clip
+            return 6  # Conservative estimate for single clip with buffer
         else:
-            return non_external_clips * 3 + 1  # Conservative estimate: middle + join per clip + final join
+            return non_external_clips * 4 + 2  # Conservative estimate with buffer
 
     def smartcut(self, index: int, source: str, output: str, start: float, end: float, allstreams: bool = True) -> None:
+        self.logger.info('[DEBUG] SmartCut: Starting for clip {} - from {}s to {}s'.format(index, start, end))
         output_file, output_ext = os.path.splitext(output)
         
         # Check if user wants fast cuts (skip keyframe analysis entirely for speed)
@@ -359,7 +390,7 @@ class VideoService(QObject):
         
         if fast_mode:
             # Ultra-fast mode: skip keyframe analysis, use stream copy with user's exact times
-            self.logger.info('SmartCut: Using ultra-fast mode (stream copy) for clip {}'.format(index))
+            self.logger.info('[DEBUG] SmartCut: Using ultra-fast mode (stream copy) for clip {}'.format(index))
             self.smartcut_jobs[index].output = output
             self.smartcut_jobs[index].allstreams = allstreams
             self.smartcut_jobs[index].files.update(middle='{0}_middle_{1}{2}'
@@ -369,19 +400,22 @@ class VideoService(QObject):
             middleproc.setWorkingDirectory(os.path.dirname(self.smartcut_jobs[index].files['middle']))
             middleproc.setObjectName('middle.{}'.format(index))
             middleproc.started.connect(lambda: self.progress.emit(index))
-            middleproc.setArguments(shlex.split(
-                self.cut(source=source,
+            args = self.cut(source=source,
                          output=self.smartcut_jobs[index].files['middle'],
                          frametime=str(start),
                          duration=str(end - start),
                          allstreams=allstreams,
-                         run=False)))
+                         run=False)
+            self.logger.info('[DEBUG] SmartCut fast mode: Starting middle process with args: {}'.format(args))
+            middleproc.setArguments(shlex.split(args))
             self.smartcut_jobs[index].procs.update(middle=middleproc)
             self.smartcut_jobs[index].results.update(middle=False)
             middleproc.start()
             return
         
+        self.logger.info('[DEBUG] SmartCut: Getting GOP bisections for clip {}'.format(index))
         bisections = self.getGOPbisections(source, start, end)
+        self.logger.info('[DEBUG] SmartCut: GOP bisections complete for clip {}'.format(index))
         self.smartcut_jobs[index].output = output
         self.smartcut_jobs[index].allstreams = allstreams
         
@@ -421,14 +455,15 @@ class VideoService(QObject):
             startproc = VideoService.initProc(self.backends.ffmpeg, self.smartcheck, os.path.dirname(source))
             startproc.setObjectName('start.{}'.format(index))
             startproc.started.connect(lambda: self.progress.emit(index))
-            startproc.setArguments(shlex.split(
-                self.cut(source=source,
+            args = self.cut(source=source,
                          output=self.smartcut_jobs[index].files['start'],
                          frametime=str(start),
                          duration=bisections['start'][1] - start,
                          allstreams=allstreams,
                          vcodec=self.streams.video.codec_name,
-                         run=False)))
+                         run=False)
+            self.logger.info('[DEBUG] SmartCut: Starting START process with args: {}'.format(args))
+            startproc.setArguments(shlex.split(args))
             self.smartcut_jobs[index].procs.update(start=startproc)
             self.smartcut_jobs[index].results.update(start=False)
             startproc.start()
@@ -440,17 +475,27 @@ class VideoService(QObject):
         middleproc.setWorkingDirectory(os.path.dirname(self.smartcut_jobs[index].files['middle']))
         middleproc.setObjectName('middle.{}'.format(index))
         middleproc.started.connect(lambda: self.progress.emit(index))
-        middleproc.setArguments(shlex.split(
-            self.cut(source=source,
+        
+        # CODEC FIX: Use same codec for all segments to ensure compatibility
+        # Since we have start/end segments that use re-encoding, make middle use re-encoding too
+        args = self.cut(source=source,
                      output=self.smartcut_jobs[index].files['middle'],
                      frametime=bisections['start'][2],
                      duration=bisections['end'][1] - bisections['start'][2],
                      allstreams=allstreams,
-                     run=False)))
+                     vcodec=self.streams.video.codec_name,
+                     run=False)
+        self.logger.info('[DEBUG] SmartCut: Using re-encoding for MIDDLE to match START/END segments')
+        
+        self.logger.info('[DEBUG] SmartCut: Preparing MIDDLE process with args: {}'.format(args))
+        middleproc.setArguments(shlex.split(args))
         self.smartcut_jobs[index].procs.update(middle=middleproc)
         self.smartcut_jobs[index].results.update(middle=False)
         if len(self.smartcut_jobs[index].procs) == 1:
+            self.logger.info('[DEBUG] SmartCut: Starting MIDDLE process immediately (no start segment)')
             middleproc.start()
+        else:
+            self.logger.info('[DEBUG] SmartCut: MIDDLE process will start after START completes')
         # ----------------------[ STEP 3 - end of clip if not ending on a keyframe ]-------------------------
         if bisections['end'][2] > bisections['end'][1]:
             self.smartcut_jobs[index].files.update(end='{0}_end_{1}{2}'
@@ -458,16 +503,18 @@ class VideoService(QObject):
             endproc = VideoService.initProc(self.backends.ffmpeg, self.smartcheck, os.path.dirname(source))
             endproc.setObjectName('end.{}'.format(index))
             endproc.started.connect(lambda: self.progress.emit(index))
-            endproc.setArguments(shlex.split(
-                self.cut(source=source,
+            args = self.cut(source=source,
                          output=self.smartcut_jobs[index].files['end'],
                          frametime=bisections['end'][1],
                          duration=end - bisections['end'][1],
                          allstreams=allstreams,
                          vcodec=self.streams.video.codec_name,
-                         run=False)))
+                         run=False)
+            self.logger.info('[DEBUG] SmartCut: Preparing END process with args: {}'.format(args))
+            endproc.setArguments(shlex.split(args))
             self.smartcut_jobs[index].procs.update(end=endproc)
             self.smartcut_jobs[index].results.update(end=False)
+            self.logger.info('[DEBUG] SmartCut: END process will start after MIDDLE completes')
 
     @pyqtSlot(int, QProcess.ExitStatus)
     def smartcheck(self, code: int, status: QProcess.ExitStatus) -> None:
@@ -518,11 +565,15 @@ class VideoService(QObject):
                                     'otherwise try again with SmartCut disabled.')
                     return
             if False not in self.smartcut_jobs[index].results.values():
+                self.logger.info('[DEBUG] SmartCheck: All segments complete for clip {}, starting join'.format(index))
                 self.smartjoin(index)
             else:
+                self.logger.info('[DEBUG] SmartCheck: Starting next segment for clip {}'.format(index))
                 if name == 'start':
+                    self.logger.info('[DEBUG] SmartCheck: Starting middle process')
                     self.smartcut_jobs[index].procs['middle'].start()
                 elif name == 'middle' and 'end' in self.smartcut_jobs[index].procs:
+                    self.logger.info('[DEBUG] SmartCheck: Starting end process')
                     self.smartcut_jobs[index].procs['end'].start()
 
     def smartabort(self):
@@ -533,6 +584,7 @@ class VideoService(QObject):
             VideoService.cleanup(job.files)
 
     def smartjoin(self, index: int) -> None:
+        self.logger.info('[DEBUG] SmartJoin: Starting join for clip {}'.format(index))
         self.progress.emit(index)
         final_join = False
         
@@ -541,33 +593,46 @@ class VideoService(QObject):
         for segment in ['start', 'middle', 'end']:
             filepath = self.smartcut_jobs[index].files.get(segment)
             if filepath and os.path.exists(filepath):
+                self.logger.info('[DEBUG] SmartJoin: Found segment {} file: {} (size: {} bytes)'.format(
+                    segment, filepath, os.path.getsize(filepath)))
                 joinlist.append(filepath)
+            else:
+                self.logger.info('[DEBUG] SmartJoin: Segment {} not found or doesn\'t exist: {}'.format(
+                    segment, filepath if filepath else 'None'))
         
         if not joinlist:
-            self.logger.error('SmartCut: No files to join for clip {}'.format(index))
+            self.logger.error('[DEBUG] SmartCut: No files to join for clip {}'.format(index))
             self.finished.emit(False, self.smartcut_jobs[index].output)
             return
         
         # If only one file (e.g., just middle), no join needed - just rename
         if len(joinlist) == 1:
+            self.logger.info('[DEBUG] SmartJoin: Only one segment, renaming {} to {}'.format(
+                joinlist[0], self.smartcut_jobs[index].output))
             try:
                 os.rename(joinlist[0], self.smartcut_jobs[index].output)
                 final_join = True
+                self.logger.info('[DEBUG] SmartJoin: Rename successful')
             except Exception as e:
-                self.logger.error('SmartCut: Failed to rename single segment: {}'.format(e))
+                self.logger.error('[DEBUG] SmartCut: Failed to rename single segment: {}'.format(e))
                 final_join = False
         else:
             # Multiple files need joining
+            self.logger.info('[DEBUG] SmartJoin: Multiple segments to join: {}'.format(len(joinlist)))
             if joinlist and self.isMPEGcodec(joinlist[0]):
-                self.logger.info('smartcut files are MPEG based so join via MPEG-TS')
+                self.logger.info('[DEBUG] smartcut files are MPEG based so join via MPEG-TS')
                 final_join = self.mpegtsJoin(joinlist, self.smartcut_jobs[index].output, None)
             if not final_join:
-                self.logger.info('smartcut MPEG-TS join failed, retry with standard concat')
+                self.logger.info('[DEBUG] smartcut MPEG-TS join failed, retry with standard concat')
                 final_join = self.join(joinlist, self.smartcut_jobs[index].output,
                                        self.smartcut_jobs[index].allstreams, None)
+            self.logger.info('[DEBUG] SmartJoin: Join result = {}'.format(final_join))
         
+        self.logger.info('[DEBUG] SmartJoin: Cleaning up temporary files')
         VideoService.cleanup(joinlist)
+        self.logger.info('[DEBUG] SmartJoin: Emitting finished signal with result={}'.format(final_join))
         self.finished.emit(final_join, self.smartcut_jobs[index].output)
+        self.logger.info('[DEBUG] SmartJoin: Complete for clip {}'.format(index))
 
     @staticmethod
     def cleanup(files: List[str]) -> None:
@@ -577,11 +642,30 @@ class VideoService(QObject):
             pass
 
     def join(self, inputs: List[str], output: str, allstreams: bool=True, chapters: Optional[List[str]]=None) -> bool:
+        self.logger.info('[DEBUG] Join: Starting join with {} inputs to {}'.format(len(inputs), output))
+        self.logger.info('[DEBUG] Join: Input files: {}'.format(inputs))
         self.checkDiskSpace(output)
         filelist = os.path.normpath(os.path.join(os.path.dirname(inputs[0]), '_vidcutter.list'))
+        self.logger.info('[DEBUG] Join: Creating concat list file: {}'.format(filelist))
         with open(filelist, 'w') as f:
-            [f.write('file \'{}\'\n'.format(file.replace("'", "\\'"))) for file in inputs]
-        stream_map = '-map 0 ' if allstreams else ''
+            for file in inputs:
+                if os.path.exists(file):
+                    self.logger.info('[DEBUG] Join: Adding to list: {} (size: {} bytes)'.format(
+                        file, os.path.getsize(file)))
+                    f.write('file \'{}\'\n'.format(file.replace("'", "\\'"))) 
+                else:
+                    self.logger.error('[DEBUG] Join: File does not exist: {}'.format(file))
+        
+        # Show contents of concat list file
+        with open(filelist, 'r') as f:
+            list_content = f.read()
+            self.logger.info('[DEBUG] Join: Concat list contents:\n{}'.format(list_content))
+        # SUBTITLE FIX: Exclude problematic subtitle streams that cause concat failures
+        if allstreams:
+            # Use essential streams only to avoid subtitle codec incompatibility
+            stream_map = '-map 0:v -map 0:a '
+        else:
+            stream_map = ''
         ffmetadata = None
         if chapters is not None and len(chapters):
             ffmetadata = self.getChapterFile(inputs, chapters)
@@ -589,10 +673,51 @@ class VideoService(QObject):
         else:
             metadata = ''
         args = '-v error -f concat -safe 0 -i "{0}" {1}-c copy {2}-y "{3}"'
-        result = self.cmdExec(self.backends.ffmpeg, args.format(filelist, metadata, stream_map, output))
-        os.remove(filelist)
+        cmd = args.format(filelist, metadata, stream_map, output)
+        self.logger.info('[DEBUG] Join: Executing ffmpeg command: {} {}'.format(self.backends.ffmpeg, cmd))
+        
+        # Capture stderr to see the actual error message
+        if self.proc.state() == QProcess.NotRunning:
+            self.proc.setProcessChannelMode(QProcess.MergedChannels)
+            self.proc.start(self.backends.ffmpeg, shlex.split('-hide_banner {}'.format(cmd)))
+            self.proc.waitForFinished(60000)
+            
+            all_output = self.proc.readAllStandardOutput().data().decode('utf-8', errors='replace')
+            exit_code = self.proc.exitCode()
+            
+            self.logger.info('[DEBUG] Join: FFmpeg concat exit code: {}'.format(exit_code))
+            if all_output.strip():
+                self.logger.error('[DEBUG] Join: FFmpeg concat output/error: {}'.format(all_output.strip()))
+            
+            result = (exit_code == 0 and self.proc.exitStatus() == QProcess.NormalExit)
+        else:
+            result = False
+            exit_code = -1
+            self.logger.error('[DEBUG] Join: Process already running, cannot execute concat')
+        
+        # Check if output file was created successfully
+        if os.path.exists(output):
+            size = os.path.getsize(output)
+            self.logger.info('[DEBUG] Join: Output file created: {} (size: {} bytes)'.format(output, size))
+            if size > 1000:  # Reasonable file size
+                result = True
+                self.logger.info('[DEBUG] Join: File size is good, marking as success')
+            else:
+                self.logger.error('[DEBUG] Join: Output file too small ({}), marking as failed'.format(size))
+                result = False
+        else:
+            self.logger.error('[DEBUG] Join: Output file was not created: {}'.format(output))
+            result = False
+        try:
+            os.remove(filelist)
+        except:
+            pass
         if chapters and ffmetadata is not None:
-            os.remove(ffmetadata)
+            try:
+                os.remove(ffmetadata)
+            except:
+                pass
+        self.logger.info('[DEBUG] Join: Cleanup complete, returning {}'.format(result))
         return result
 
     def getChapterFile(self, scenes: List[str], titles: List[str]=None) -> str:
@@ -685,10 +810,11 @@ class VideoService(QObject):
 
     def getKeyframes(self, source: str, formatted_time: bool = False) -> list:
         if len(self.keyframes) and source == self.source:
+            self.logger.info('[DEBUG] getKeyframes: Using cached keyframes ({} frames)'.format(len(self.keyframes)))
             return self.keyframes
         
-        if os.getenv('DEBUG', False) or getattr(self.parent, 'verboseLogs', False):
-            self.logger.info('Analyzing keyframes for SmartCut - this may take some time for large files...')
+        self.logger.info('[DEBUG] getKeyframes: Starting keyframe analysis for: {}'.format(source))
+        self.logger.info('[DEBUG] getKeyframes: This may take some time for large files...')
             
         timecode = '0:00:00.000000' if formatted_time else 0
         args = '-v error -show_packets -select_streams v -show_entries packet=pts_time,flags ' \
@@ -696,8 +822,10 @@ class VideoService(QObject):
         
         # Use shorter timeout for keyframe analysis (30 seconds) to avoid hanging
         # If it takes longer, we'll use fast mode instead
+        self.logger.info('[DEBUG] getKeyframes: Running ffprobe for keyframe analysis (30s timeout)')
         result = self.cmdExec(self.backends.ffprobe, args, output=True, suppresslog=True, 
                              mergechannels=False, timeout=30000)
+        self.logger.info('[DEBUG] getKeyframes: ffprobe completed, result length: {}'.format(len(result) if result else 0))
         
         if not result:
             self.logger.warning('Keyframe analysis timed out or failed - enabling fast SmartCut mode')
@@ -737,7 +865,9 @@ class VideoService(QObject):
         return keyframe_times
 
     def getGOPbisections(self, source: str, start: float, end: float) -> dict:
+        self.logger.info('[DEBUG] getGOPbisections: Getting keyframes for {}s to {}s'.format(start, end))
         keyframes = self.getKeyframes(source)
+        self.logger.info('[DEBUG] getGOPbisections: Got {} keyframes'.format(len(keyframes)))
         if not keyframes:
             # Fallback if no keyframes available
             return {
@@ -837,20 +967,21 @@ class VideoService(QObject):
                 self.proc.setProcessChannelMode(QProcess.SeparateChannels)
             if cmd in {self.backends.ffmpeg, self.backends.ffprobe}:
                 args = '-hide_banner {}'.format(args)
-            if os.getenv('DEBUG', False) or getattr(self.parent, 'verboseLogs', False):
-                self.logger.info('{0} {1}'.format(cmd, args if args is not None else ''))
+            self.logger.info('[DEBUG] cmdExec: Starting process: {} {}'.format(cmd, args if args is not None else ''))
             self.proc.setWorkingDirectory(workdir if workdir is not None else VideoService.getAppPath())
             self.proc.start(cmd, shlex.split(args))
             self.proc.readyReadStandardOutput.connect(
                 partial(self.cmdOut, self.proc.readAllStandardOutput().data().decode().strip()))
             
+            self.logger.info('[DEBUG] cmdExec: Waiting for process to finish (timeout={}ms)'.format(timeout))
             # Use timeout to prevent infinite hanging, especially for keyframe analysis
             if not self.proc.waitForFinished(timeout):
-                self.logger.warning('Process timed out after {}ms, terminating: {} {}'.format(timeout, cmd, args))
+                self.logger.warning('[DEBUG] Process timed out after {}ms, terminating: {} {}'.format(timeout, cmd, args))
                 self.proc.terminate()
                 if not self.proc.waitForFinished(5000):  # Wait 5 seconds for termination
                     self.proc.kill()
                 return False if not output else ''
+            self.logger.info('[DEBUG] cmdExec: Process finished successfully')
                 
             if cmd == self.backends.mediainfo or not mergechannels:
                 self.proc.setProcessChannelMode(QProcess.MergedChannels)

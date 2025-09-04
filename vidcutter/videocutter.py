@@ -1363,13 +1363,14 @@ class VideoCutter(QWidget):
                     self.videoService.fast_smartcut = True
                     self.logger.info('Fast SmartCut mode enabled via environment variable')
                     
+                self.logger.info('[DEBUG] SaveMedia: Starting SmartCut mode')
                 source_media = '{0}{1}'.format(source_file, source_ext)
                 smartcut_steps = self.videoService.calculateSmartCutSteps(source_media, self.clipTimes)
-                if os.getenv('DEBUG', False) or getattr(self, 'verboseLogs', False):
-                    self.logger.info('SmartCut calculated steps: {} for {} clips'.format(smartcut_steps, clips))
+                self.logger.info('[DEBUG] SmartCut calculated steps: {} for {} clips'.format(smartcut_steps, clips))
                 self.seekSlider.showProgress(smartcut_steps)
                 self.parent.lock_gui(True)
                 self.videoService.smartinit(clips)
+                self.logger.info('[DEBUG] SaveMedia: Calling smartcutter')
                 self.smartcutter(file, source_file, source_ext)
                 return
             steps = 3 if clips > 1 else 2
@@ -1424,13 +1425,20 @@ class VideoCutter(QWidget):
 
     @pyqtSlot(bool, str)
     def smartmonitor(self, success: bool = None, outputfile: str = None) -> None:
+        self.logger.info('[DEBUG] SmartMonitor: Called with success={}, outputfile={}'.format(success, outputfile))
         if success is not None:
             if not success:
                 self.logger.error('SmartCut failed for {}'.format(outputfile))
             self.smartcut_monitor.results.append(success)
+            self.logger.info('[DEBUG] SmartMonitor: Results so far: {} / {}'.format(
+                len(self.smartcut_monitor.results), len(self.smartcut_monitor.clips) - self.smartcut_monitor.externals))
         if len(self.smartcut_monitor.results) == len(self.smartcut_monitor.clips) - self.smartcut_monitor.externals:
+            self.logger.info('[DEBUG] SmartMonitor: All clips processed, checking results')
             if False not in self.smartcut_monitor.results:
+                self.logger.info('[DEBUG] SmartMonitor: All successful, joining media')
                 self.joinMedia(self.smartcut_monitor.clips)
+            else:
+                self.logger.error('[DEBUG] SmartMonitor: Some clips failed')
 
     def joinMedia(self, filelist: list) -> None:
         if len(filelist) > 1:
